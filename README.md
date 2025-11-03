@@ -1,5 +1,7 @@
 # rag-automation-qa-bot
 
+A Retrieval-Augmented Generation (RAG) system that answers questions by retrieving relevant context from a document store and generating accurate responses using an LLM. 
+
 ## How to Use 
 
 Follow the steps below to run and interact with the project:
