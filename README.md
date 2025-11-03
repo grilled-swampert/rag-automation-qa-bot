@@ -54,4 +54,6 @@ Use the interface to upload a PDF file containing the content you want to query.
 - Retrieve relevant chunks of text from the uploaded document.
 - Generate a precise and context-aware response.
 
+### Architecture Flow
+
 <img width="815" height="858" alt="image" src="https://github.com/user-attachments/assets/5bc10512-e76d-420a-a440-e52e017b44b9" />
