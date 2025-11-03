@@ -1,46 +1,93 @@
-import streamlit as st
+import cohere
+import fitz
+from pinecone import Pinecone, ServerlessSpec
 
-def main():
-    st.title("document-qa-bot")
-    st.write("upload a pdf, and ask questions based on its content")
+class VectorStore:
+    def __init__(self, pdf_path: str, cohere_api_key: str, pinecone_api_key: str):
+        self.pdf_path = pdf_path
+        self.co = cohere.ClientV2(cohere_api_key)
+        self.pinecone_api_key = pinecone_api_key
+        self.chunks = []
+        self.embeddings = []
+        self.retrieve_top_k = 10
+        self.rerank_top_k = 3
+        self.load_pdf()
+        self.split_text()
+        self.embed_chunks()
+        self.index_chunks()
 
-    uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+    def load_pdf(self):
+        self.pdf_text = self.extract_text_from_pdf(self.pdf_path)
 
-    if uploaded_file is not None:
-        st.write("File uploaded successfully!")
-    
-    user_query = st.text_input("Ask a question based on the document")
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        text = ""
+        with fitz.open(pdf_path) as pdf:
+            for page_num in range(pdf.page_count):
+                page = pdf.load_page(page_num)
+                text += page.get_text("text")
+        return text
 
-    if st.button("Submit") and uploaded_file:
-        with st.spinner("Processing PDF..."):
-            with open("uploaded_document.pdf", "wb") as f:
-                f.write(uploaded_file.read())
+    def split_text(self, chunk_size=1000):
+        sentences = self.pdf_text.split(". ")
+        current_chunk = ""
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < chunk_size:
+                current_chunk += sentence + ". "
+            else:
+                self.chunks.append(current_chunk)
+                current_chunk = sentence + ". "
+        if current_chunk:
+            self.chunks.append(current_chunk)
 
-            vector_store = VectorStore("uploaded_document.pdf", st.secrets["cohere_api_key"], st.secrets["pinecone_api_key"])
-            chatbot = Chatbot(vector_store, st.secrets["cohere_api_key"])
+    def embed_chunks(self, batch_size=90):
+        total_chunks = len(self.chunks)
+        for i in range(0, total_chunks, batch_size):
+            batch = self.chunks[i:min(i + batch_size, total_chunks)]
+            batch_embeddings = self.co.embed(
+                texts=batch, 
+                input_type="search_document", 
+                model="embed-english-v3.0",
+                embedding_types=["float"]
+            ).embeddings.float
+            self.embeddings.extend(batch_embeddings)
 
-            with st.spinner("Generating response..."):
-                response, retrieved_docs = chatbot.respond(user_query)
+    def index_chunks(self):
+        """
+        Indexes the embedded chunks using Pinecone.
+        """
+        pc = Pinecone(
+            api_key=self.pinecone_api_key
+        )
 
-                st.session_state["chat_history"].append((user_query, response, retrieved_docs))
-            
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
+        index_name = 'rag-qa-bot'
+        if index_name not in pc.list_indexes().names():
+            pc.create_index(
+                name=index_name,
+                dimension=len(self.embeddings[0]),
+                metric='cosine',
+                spec=ServerlessSpec(
+                    cloud='aws',
+                    region='us-east-1'
+                )
+            )
+        self.index = pc.Index(index_name)
+        chunks_metadata = [{'text': chunk} for chunk in self.chunks]
+        ids = [str(i) for i in range(len(self.chunks))]
+        self.index.upsert(vectors=zip(ids, self.embeddings, chunks_metadata))
 
-    if st.session_state["chat_history"]:
-        for user_query, response, retrieved_docs in st.session_state["chat_history"]:
-            st.write(f"**You:** {user_query}")
-
-            accumulated_response = ""
-            for event in response:
-                # Handle different event types in Cohere V2 API
-                if hasattr(event, 'type'):
-                    if event.type == "content-delta":
-                        if hasattr(event, 'delta') and hasattr(event.delta, 'message'):
-                            if hasattr(event.delta.message, 'content'):
-                                if hasattr(event.delta.message.content, 'text'):
-                                    accumulated_response += event.delta.message.content.text
-            st.write(f"**Bot:** {accumulated_response}")
-
-if __name__ == "__main__":
-    main()
+    def retrieve(self, query: str) -> list:
+        query_emb = self.co.embed(
+            texts=[query], 
+            model="embed-english-v3.0", 
+            input_type="search_query",
+            embedding_types=["float"]
+        ).embeddings.float
+        res = self.index.query(vector=query_emb[0], top_k=self.retrieve_top_k, include_metadata=True)
+        docs_to_rerank = [match['metadata']['text'] for match in res['matches']]
+        rerank_results = self.co.rerank(
+            query=query,
+            documents=docs_to_rerank,
+            top_n=self.rerank_top_k,
+            model="rerank-english-v3.0"
+        )
+        return [{"text": docs_to_rerank[result.index]} for result in rerank_results.results]
