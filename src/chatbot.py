@@ -1,3 +1,6 @@
+import cohere
+import uuid
+
 class Chatbot:
     def __init__(self, vectorstore, cohere_api_key: str):
         self.vectorstore = vectorstore
